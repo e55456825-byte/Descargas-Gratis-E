@@ -58,7 +58,7 @@ async def seed_default_revistas() -> None:
 
     # (PREFIJO_ENV, rev_id, nombre, base_url, contexto, user, pass, sub, key)
     catalogo = [
-        ("KIKI",  "KIKI_REV",  "Revista Cardiología", "https://revistaciaf.uclv.edu.cu",   "uclv",   "proslayerrs", "Dairon2005#", "3505",  "default_key_1"),
+        ("KIKI",  "KIKI_REV",  "Revista Cardiología", "https://revistaciaf.uclv.edu.cu",   "uclv",   "emanuel14", "140909", "65260",  "default_key_1"),
         ("COMED", "COMED_REV", "Revista COMED",       "https://revcocmed.sld.cu",          "cocmed", "proslayerrs", "Dairon2005#", "5577",  "default_key_2"),
         ("LUZ",   "LUZ_REV",   "Revista LUZ",         "https://revistavarela.uclv.edu.cu", "uclv",   "emanuel14",   "140909",      "2077",  "default_key_3"),
         ("CANEL", "Canel_REV", "Revista Canel",       "https://rus.ucf.edu.cu",            "rus",    "emanuel16",   "140909",      "6200",  "default_key_4"),
