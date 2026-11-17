@@ -43,6 +43,32 @@ def register(app) -> None:
             f"📤 Subidas diarias: {daily}\n"
             f"📅 Vigencia: 30 días desde la asignación/renovación.")
 
+    # ── /planes — ver todos los planes del bot + el tuyo ────────────
+    @app.on_message(filters.command("planes"))
+    @authorized_only
+    @safe_handler
+    async def planes_handler(client, message):
+        user = await db.get_user(message.from_user.id) or {"plan": "basico"}
+        key = get_active_plan(user)
+        text = "📋 **Planes del bot**\n\n"
+        for k, p in PLANS.items():
+            mark = "👉 " if k == key else "• "
+            max_size = format_size(p["max_file_bytes"]) if p["max_file_bytes"] else "Ilimitado"
+            daily = str(p["daily_uploads"]) if p["daily_uploads"] is not None else "Ilimitadas"
+            text += (
+                f"{mark}**{p['name']}**\n"
+                f"   ⏱️ Enlace: {p['hours']} horas\n"
+                f"   📁 Máx. por archivo: {max_size}\n"
+                f"   📤 Subidas diarias: {daily}\n"
+                f"   📅 Duración: {p['days']} días\n\n"
+            )
+        expiry = (user or {}).get("plan_expires_at")
+        text += f"📦 **Tu plan actual: {PLANS[key]['name']}**\n"
+        if expiry:
+            text += f"🗓️ Vence: `{str(expiry)[:10]}`\n"
+        text += "\n💡 Para cambiar de plan, contacta al administrador."
+        await message.reply(text)
+
     # ── /start ──────────────────────────────────────────────────────
     @app.on_message(filters.command("start"))
     @safe_handler
@@ -67,11 +93,15 @@ def register(app) -> None:
                 "• `/clear_rev` - Limpiar archivos de una revista\n"
                 "• `/zips <tamaño>` - Cambiar tamaño de partes\n"
                 "• `/status` - Ver estado del sistema\n"
+                "• `/plan` - Ver tu plan actual\n"
+                "• `/planes` - Ver todos los planes del bot\n"
                 "• `/bitzero <revista> <modo>` - Cambiar modo BitZero\n"
                 "• `/bitzero_status` - Ver estado BitZero\n"
                 "• `/test_bitzero <modo> [archivo]` - Probar codificación\n"
                 "• `/history` - Ver tu historial de subidas\n"
-                "• `/control_panel` - Panel de administración (solo admins)\n\n"
+                "• `/control_panel` - Panel de administración (solo admins)\n"
+                "• `/addrevista` - Agregar una revista (solo admins)\n"
+                "• `/setplan <user_id> <plan>` - Asignar plan (solo admins)\n\n"
                 f"💾 **Tu carpeta:** `raiz/{user_id}/`\n"
                 f"📦 **Tamaño partes:** {config.CHUNK_SIZE_MB} MB\n\n"
                 f"👨‍💻 **Desarrollador:** {config.DEVELOPER_HANDLE}"

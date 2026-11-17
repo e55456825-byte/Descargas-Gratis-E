@@ -26,6 +26,35 @@ from handlers.upload import get_or_create_uploader, perform_upload_with_bitzero
 logger = logging.getLogger(__name__)
 
 
+def parse_cp_field_callback(data: str, revistas: list) -> tuple:
+    """Parsea `cp_field_<rev_id>_<campo>`.
+
+    FIX v2.1: el rev_id lleva guiones bajos (KIKI_REV, COMED_REV...), así
+    que `data.split("_")` lo partía mal (rev_id='KIKI', campo='REV_...') y
+    editar CUALQUIER campo fallaba con "Revista no encontrada". Ahora se
+    busca el rev_id real más largo que sea prefijo del resto.
+    Devuelve (rev_id, campo) o (None, None) si no matchea.
+    """
+    rest = data[len("cp_field_"):]
+    best = None
+    for r in revistas:
+        rid = r['rev_id']
+        if rest == rid or rest.startswith(rid + "_"):
+            if best is None or len(rid) > len(best):
+                best = rid
+    if best is None:
+        return None, None
+    field = rest[len(best) + 1:] if rest != best else ""
+    return (best, field) if field else (None, None)
+
+
+# Campos que el panel permite editar (deben existir en la whitelist de
+# db.update_revista_field; 'bitzero' es el nombre del botón y se mapea
+# a 'bitzero_mode' en handle_admin_input).
+EDITABLE_FIELDS = {'username', 'password', 'submission_id', 'bitzero',
+                   'encryption_key', 'base_url', 'contexto', 'nombre'}
+
+
 def register(app) -> None:
 
     @app.on_callback_query()
@@ -176,13 +205,11 @@ def register(app) -> None:
             return
 
         if data.startswith("cp_field_"):
-            parts = data.split("_")
-            # formato: cp_field_<rev_id>_<campo>
-            if len(parts) < 4:
-                await callback_query.answer("Formato inválido", show_alert=True)
+            revistas = await db.list_revistas()
+            rev_id, field = parse_cp_field_callback(data, revistas)
+            if not rev_id or field not in EDITABLE_FIELDS:
+                await callback_query.answer("Revista o campo no válido", show_alert=True)
                 return
-            rev_id = parts[2]
-            field = "_".join(parts[3:])
             set_admin_state(user_id, {
                 "action": "edit_field",
                 "rev_id": rev_id,
@@ -214,10 +241,28 @@ def register(app) -> None:
             )
             ok = uploader.login()
             await db.update_revista_login_status(rev_id, ok)
+            if ok:
+                await callback_query.message.edit_text(
+                    f"✅ **Conexión exitosa con {revista['nombre']}**\n\n"
+                    f"🌐 Contexto usado: `{uploader._ctx()}`"
+                )
+            else:
+                reason = getattr(uploader, 'last_login_error', None) or "Revisa credenciales."
+                await callback_query.message.edit_text(
+                    f"❌ **Falló la conexión con {revista['nombre']}.**\n\n{reason}"
+                )
+            return
+
+        if data == "cp_add_revista":
+            from handlers.admin import ADD_REVISTA_STEPS
+            set_admin_state(user_id, {"action": "add_revista", "step": 0, "data": {}})
             await callback_query.message.edit_text(
-                f"✅ **Conexión exitosa.**" if ok
-                else f"❌ **Falló la conexión.** Revisa credenciales."
+                "📚 **Agregar revista**\n\n"
+                "Te iré pidiendo los datos uno por uno. Escribe `cancelar` en "
+                "cualquier momento para salir.\n\n"
+                + ADD_REVISTA_STEPS[0][1]
             )
+            await callback_query.answer()
             return
 
         if data == "cp_back":
@@ -228,6 +273,7 @@ def register(app) -> None:
                     f"📚 {r['nombre']} (Modo {r.get('bitzero_mode', 0)})",
                     callback_data=f"cp_edit_{r['rev_id']}"
                 )])
+            keyboard.append([InlineKeyboardButton("➕ Agregar revista", callback_data="cp_add_revista")])
             keyboard.append([InlineKeyboardButton("❌ Cerrar", callback_data="cp_close")])
             await callback_query.message.edit_text(
                 "🔧 **Panel de Control de Revistas**\n\n"

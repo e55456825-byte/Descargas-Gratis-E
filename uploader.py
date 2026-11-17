@@ -40,12 +40,14 @@ class RevistaUploader:
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
         })
+        # NOTA: 'X-Requested-With' NO va aquí: el login de OJS es un form
+        # normal y con esa cabecera algunas revistas responden distinto.
+        # Solo se envía en el POST de la API de archivos (_do_upload_request).
         self.session.verify = False  # revistas cubanas suelen tener cert self-signed
 
         self.csrf_token: Optional[str] = None
@@ -57,19 +59,81 @@ class RevistaUploader:
         self.encryption_key = encryption_key
         self.uploaded_files: List[Dict[str, Any]] = []
         self.is_logged_in = False
+        # Contexto REAL del journal, aprendido del redirect tras el login
+        # (p. ej. KIKI: el seed decía 'uclv' pero el journal es 'revista').
+        self.effective_contexto: Optional[str] = None
+        # Motivo del último login fallido (código + texto para el usuario).
+        self.last_login_reason: Optional[str] = None
+        self.last_login_error: Optional[str] = None
+
+    def _ctx(self) -> str:
+        """Contexto a usar en wizard/API: el real si se aprendió, si no el de la DB."""
+        return self.effective_contexto or self.contexto
 
     # ── Login ────────────────────────────────────────────────────────
     def login(self) -> bool:
+        """Inicia sesión en OJS. Devuelve True si el login funcionó.
+
+        FIX v2.1 (verificado en vivo contra las 4 revistas):
+          1. La URL del POST NO es siempre /{contexto}/login/signIn: el
+             form real de KIKI postea a /index/login/signIn y postear a
+             /uclv/login/signIn da 404. Ahora se lee el `action` del form.
+          2. La detección de éxito buscaba 'Cerrar sesión'/'Logout', que
+             NO existen en OJS 3.4 (el header muestra el usuario y el link
+             es 'signOut'). Ahora se detecta por 'signOut', por el nombre
+             de usuario en la página y por salir de la URL de login.
+          3. El contexto del seed puede estar mal (KIKI es 'revista', no
+             'uclv'; LUZ es 'rv'). Tras el login se aprende el contexto
+             real de la URL final y se usa en wizard/API.
+          4. Antes todo fallo era un genérico "login fallido". Ahora
+             `last_login_reason`/`last_login_error` dicen el motivo real:
+             credenciales rechazadas, captcha, sitio caído o 404.
+        """
+        self.last_login_reason = None
+        self.last_login_error = None
         try:
             login_url = f"{self.base_url}/index.php/{self.contexto}/login"
             resp = self.session.get(login_url, timeout=30)
-            soup = BeautifulSoup(resp.text, 'html.parser')
+            if resp.status_code != 200 or 'signIn' not in resp.text:
+                # Fallback: login a nivel de sitio (/index/login).
+                alt_url = f"{self.base_url}/index.php/index/login"
+                alt = self.session.get(alt_url, timeout=30)
+                if alt.status_code == 200 and 'signIn' in alt.text:
+                    resp = alt
+                else:
+                    self.last_login_reason = 'not_found'
+                    self.last_login_error = (
+                        f"La página de login no responde (HTTP {resp.status_code}). "
+                        "Revisa la URL base y el contexto de la revista."
+                    )
+                    logger.warning(f"Login fallido en {self.base_url}: {self.last_login_error}")
+                    self.is_logged_in = False
+                    return False
 
+            # Captcha en el login: el bot no puede resolverlo solo.
+            low_page = resp.text.lower()
+            if any(m in low_page for m in ('g-recaptcha', 'h-captcha', 'cf-turnstile')):
+                self.last_login_reason = 'captcha'
+                self.last_login_error = (
+                    "La revista pide captcha en el login y el bot no puede "
+                    "resolverlo solo. Pide al administrador de la revista que "
+                    "desactive el captcha para esta cuenta."
+                )
+                logger.warning(f"Login bloqueado por captcha en {self.base_url}")
+                self.is_logged_in = False
+                return False
+
+            soup = BeautifulSoup(resp.text, 'html.parser')
             csrf_token = self._extract_csrf(soup, resp.text)
             if not csrf_token:
                 logger.warning("CSRF no encontrado en login, continuando con token temporal")
                 csrf_token = "temp_token"
             self.csrf_token = csrf_token
+
+            # URL real del form (no asumir /{contexto}/login/signIn).
+            post_url = self._login_action_url(soup)
+            if not post_url:
+                post_url = f"{self.base_url}/index.php/{self.contexto}/login/signIn"
 
             data = {
                 'csrfToken': csrf_token,
@@ -78,20 +142,105 @@ class RevistaUploader:
                 'remember': '1',
                 'source': '',
             }
-            post_url = f"{self.base_url}/index.php/{self.contexto}/login/signIn"
             resp = self.session.post(post_url, data=data, timeout=30)
 
-            if any(x in resp.text for x in ['Cerrar sesión', 'submissionId=', 'Logout', 'Sign out']):
-                logger.info(f"Login OK en {self.base_url}")
+            if self._login_success(resp):
                 self.is_logged_in = True
+                self.last_login_reason = 'ok'
+                self._learn_context(resp)
+                logger.info(f"Login OK en {self.base_url} (contexto: {self._ctx()})")
                 return True
-            logger.warning(f"Login fallido en {self.base_url}")
+
+            # ── Falló: identificar el motivo real ──────────────────
+            low = resp.text.lower()
+            if any(m in low for m in ('no son válidos', 'invalid username',
+                                       'invalid password', 'usuario o la contraseña')):
+                reason, msg = ('bad_credentials',
+                               "La revista rechazó el usuario o la contraseña. "
+                               "Actualízalos en /control_panel.")
+            elif 'g-recaptcha' in low or 'h-captcha' in low:
+                reason, msg = ('captcha',
+                               "La revista pide captcha en el login y el bot no "
+                               "puede resolverlo solo.")
+            elif resp.status_code == 404:
+                reason, msg = ('not_found',
+                               f"La URL de login devolvió 404 ({post_url}). "
+                               "Revisa el contexto de la revista.")
+            elif 'login' in (resp.url or ''):
+                reason, msg = ('bad_credentials',
+                               "La revista no aceptó las credenciales "
+                               "(sigue en la página de login).")
+            else:
+                reason, msg = ('unknown',
+                               f"No se pudo confirmar el login (HTTP {resp.status_code}).")
+            self.last_login_reason = reason
+            self.last_login_error = msg
+            logger.warning(f"Login fallido en {self.base_url}: {msg}")
             self.is_logged_in = False
             return False
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
+            self.last_login_reason = 'site_down'
+            self.last_login_error = (
+                f"No se pudo conectar con la revista ({e.__class__.__name__}). "
+                "El sitio puede estar caído o sin respuesta."
+            )
             logger.error(f"login error: {e}")
             self.is_logged_in = False
             return False
+        except Exception as e:
+            self.last_login_reason = 'unknown'
+            self.last_login_error = f"Error inesperado en login: {e}"
+            logger.error(f"login error: {e}")
+            self.is_logged_in = False
+            return False
+
+    def _login_action_url(self, soup: BeautifulSoup) -> Optional[str]:
+        """Lee el `action` real del form de login (puede ser /index/...)."""
+        form = soup.find('form', {'id': 'login'}) or soup.find('form')
+        if not form:
+            return None
+        action = (form.get('action') or '').strip()
+        if not action or 'signIn' not in action:
+            return None
+        if action.startswith('http'):
+            return action
+        # Relativa: resolver contra la base.
+        from urllib.parse import urljoin
+        return urljoin(self.base_url + '/', action.lstrip('/'))
+
+    @staticmethod
+    def _login_success(resp: Any) -> bool:
+        """¿La respuesta del POST es una sesión iniciada?
+
+        OJS 3.4 no muestra 'Cerrar sesión'/'Logout' en texto plano: el
+        header trae el nombre del usuario y un link 'signOut'. Se aceptan
+        los marcadores viejos y los nuevos.
+        """
+        text = resp.text or ''
+        url = resp.url or ''
+        if any(x in text for x in ('signOut', 'Cerrar sesión', 'Logout', 'Sign out')):
+            return True
+        if 'submissionId=' in text:
+            return True
+        # Fuera de la página de login y con contenido de usuario logueado.
+        if '/login' not in url and any(x in text for x in ('submissions', 'dashboard', 'profile')):
+            return True
+        return False
+
+    def _learn_context(self, resp: Any) -> None:
+        """Aprende el contexto real del journal desde la URL final o el
+        link signOut (p. ej. KIKI: 'revista', no 'uclv')."""
+        candidates = [resp.url or '']
+        m = re.search(r'/index\.php/([^/]+)/login/signOut', resp.text or '')
+        if m:
+            candidates.append(f"/index.php/{m.group(1)}/")
+        for url in candidates:
+            m = re.search(r'/index\.php/([^/]+)/', url)
+            if m and m.group(1) not in ('index', 'login'):
+                if m.group(1) != self.contexto:
+                    logger.info(f"Contexto real detectado: '{m.group(1)}' (DB decía '{self.contexto}')")
+                self.effective_contexto = m.group(1)
+                return
 
     @staticmethod
     def _extract_csrf(soup: BeautifulSoup, html: str) -> Optional[str]:
@@ -111,12 +260,14 @@ class RevistaUploader:
 
     def check_session(self) -> bool:
         try:
-            test_url = (f"{self.base_url}/index.php/{self.contexto}/submission/wizard/2"
+            test_url = (f"{self.base_url}/index.php/{self._ctx()}/submission/wizard/2"
                         f"?submissionId={self.submission_id}")
             resp = self.session.get(test_url, timeout=10, allow_redirects=False)
             if resp.status_code == 302 and 'login' in resp.headers.get('Location', '').lower():
                 return False
-            return resp.status_code == 200 and 'submissionId' in resp.text
+            return resp.status_code == 200 and any(
+                x in resp.text for x in ('submissionId', 'csrfToken', 'step-2')
+            )
         except Exception:
             return False
 
@@ -133,7 +284,7 @@ class RevistaUploader:
         if not self.submission_id:
             return False
         try:
-            step2_url = (f"{self.base_url}/index.php/{self.contexto}/submission/wizard/2"
+            step2_url = (f"{self.base_url}/index.php/{self._ctx()}/submission/wizard/2"
                          f"?submissionId={self.submission_id}#step-2")
             resp = self.session.get(step2_url, timeout=30)
             if "step-2" not in resp.url and "submission/wizard" not in resp.url:
@@ -245,14 +396,15 @@ class RevistaUploader:
     def _do_upload_request(self, file_name: str, file_content: bytes,
                            content_type: str) -> Optional[Dict[str, Any]]:
         """Hace el POST de subida con retry en 403 (CSRF expirado)."""
-        api_url = (f"{self.base_url}/index.php/{self.contexto}/api/v1/submissions/"
+        api_url = (f"{self.base_url}/index.php/{self._ctx()}/api/v1/submissions/"
                    f"{self.submission_id}/files")
-        referer = (f"{self.base_url}/index.php/{self.contexto}/submission/wizard/2"
+        referer = (f"{self.base_url}/index.php/{self._ctx()}/submission/wizard/2"
                    f"?submissionId={self.submission_id}")
 
         for attempt in range(2):  # máximo 2 intentos (original + retry por 403)
             headers = {
                 'X-Csrf-Token': self.csrf_token or '',
+                'X-Requested-With': 'XMLHttpRequest',
                 'Referer': referer,
             }
             files = {'file': (file_name, file_content, content_type)}
@@ -358,7 +510,7 @@ class RevistaUploader:
             user=self.username,
             password=self.password,
             repo=self.submission_id,
-            contexto=self.contexto,
+            contexto=self._ctx(),
             file_ids=file_ids,
             bitzero_mode=self.bitzero_mode,
             original_name=original_name,

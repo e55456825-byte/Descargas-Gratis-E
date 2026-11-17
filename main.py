@@ -57,10 +57,14 @@ async def seed_default_revistas() -> None:
         return
 
     # (PREFIJO_ENV, rev_id, nombre, base_url, contexto, user, pass, sub, key)
+    # FIX v2.1: contextos corregidos (verificado en vivo):
+    #   KIKI es 'revista' (con 'uclv' el POST de login da 404 y el wizard
+    #   redirige al login); LUZ es 'rv' (la home redirige a /index.php/rv
+    #   y /uclv/login da 404).
     catalogo = [
-        ("KIKI",  "KIKI_REV",  "Revista Cardiología", "https://revistaciaf.uclv.edu.cu",   "uclv",   "emanuel14", "140909", "65260",  "default_key_1"),
+        ("KIKI",  "KIKI_REV",  "Revista Cardiología", "https://revistaciaf.uclv.edu.cu",   "revista", "emanuel14", "140909", "65260",  "default_key_1"),
         ("COMED", "COMED_REV", "Revista COMED",       "https://revcocmed.sld.cu",          "cocmed", "proslayerrs", "Dairon2005#", "5577",  "default_key_2"),
-        ("LUZ",   "LUZ_REV",   "Revista LUZ",         "https://revistavarela.uclv.edu.cu", "uclv",   "emanuel14",   "140909",      "2077",  "default_key_3"),
+        ("LUZ",   "LUZ_REV",   "Revista LUZ",         "https://revistavarela.uclv.edu.cu", "rv",   "emanuel14",   "140909",      "2077",  "default_key_3"),
         ("CANEL", "Canel_REV", "Revista Canel",       "https://rus.ucf.edu.cu",            "rus",    "emanuel16",   "140909",      "6200",  "default_key_4"),
     ]
     defaults = []
@@ -80,6 +84,23 @@ async def seed_default_revistas() -> None:
     logger.info(f"Seed completado: {len(defaults)} revistas insertadas.")
 
 
+async def fix_known_contextos() -> None:
+    """Corrige en la DB existente los contextos que el seed traía mal.
+
+    Solo toca las filas que todavía tienen el valor viejo y erróneo:
+    KIKI_REV 'uclv' → 'revista', LUZ_REV 'uclv' → 'rv' (verificado en
+    vivo: con 'uclv' el login da 404 y el wizard redirige al login).
+    El login además aprende el contexto real solo, esto es solo para que
+    la DB deje de decir algo falso.
+    """
+    fixes = {"KIKI_REV": "revista", "LUZ_REV": "rv"}
+    for rev_id, good_ctx in fixes.items():
+        r = await db.get_revista(rev_id)
+        if r and r.get("contexto") == "uclv":
+            await db.update_revista_field(rev_id, "contexto", good_ctx)
+            logger.info(f"Contexto corregido en DB: {rev_id} 'uclv' → '{good_ctx}'")
+
+
 async def prelogin_revistas() -> None:
     """Intenta login en cada revista para detectar fallos temprano."""
     from uploader import RevistaUploader
@@ -97,14 +118,17 @@ async def prelogin_revistas() -> None:
         ok = await loop.run_in_executor(None, uploader.login)
         await db.update_revista_login_status(r['rev_id'], ok)
         if ok:
-            logger.info(f"  ✅ {r['nombre']}: login OK")
+            logger.info(f"  ✅ {r['nombre']}: login OK (contexto: {uploader._ctx()})")
         else:
-            logger.warning(f"  ❌ {r['nombre']}: login fallido")
+            logger.warning(
+                f"  ❌ {r['nombre']}: login fallido "
+                f"({uploader.last_login_reason}: {uploader.last_login_error})"
+            )
 
 
 async def main_async() -> None:
     logger.info("=" * 60)
-    logger.info("🚀 Iniciando Bit Uploader v2 (modular)")
+    logger.info("🚀 Iniciando Bit Uploader v2.1 (corregido)")
     logger.info("=" * 60)
 
     # 1. Inicializar DB
@@ -113,6 +137,7 @@ async def main_async() -> None:
     # 2. Seed de admins (semilla + dinámicos) y revistas
     await seed_admins()
     await seed_default_revistas()
+    await fix_known_contextos()
 
     # 3. Pyrogram client
     from pyrogram import Client

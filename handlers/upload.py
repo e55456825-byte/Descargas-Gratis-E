@@ -130,7 +130,8 @@ async def perform_upload_with_bitzero(client, message, uploader: RevistaUploader
         return
 
     if not uploader.ensure_logged_in():
-        await message.edit_text("❌ **Error de autenticación.** No se pudo iniciar sesión.")
+        reason = getattr(uploader, 'last_login_error', None) or "No se pudo iniciar sesión."
+        await message.edit_text(f"❌ **Error de autenticación.**\n\n{reason}")
         await db.update_revista_login_status(revista['rev_id'], False)
         return
     await db.update_revista_login_status(revista['rev_id'], True)
